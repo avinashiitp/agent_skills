@@ -1,47 +1,55 @@
-# 🧠 Level 7 — Agent + Skills + MCP
+# 🧠 Level 8 — Agent + Skills + MCP + Memory
 
-An extension of the [Agent-to-Agent-to-MCP](https://github.com/avinashiitp/agent_to_agent) project (Levels 5–6) that adds **Skills** — structured SOPs that tell each agent not just *what* to do but *how* to do it.
+An extension of [Level 7 (Skills)](https://github.com/avinashiitp/agent_skills) that adds **persistent Memory** — every agent now remembers past interactions across sessions using ChromaDB vector storage.
 
-> **This repo covers Level 7 only.**
+> **This repo covers Level 8 only.**
+> For Level 7 (Skills/SOPs): 👉 [avinashiitp/agent_skills](https://github.com/avinashiitp/agent_skills)
 > For Levels 5–6 (Agent-to-Agent + MCP): 👉 [avinashiitp/agent_to_agent](https://github.com/avinashiitp/agent_to_agent)
 > For Levels 1–4 (single agent → MCP foundations): 👉 [avinashiitp/MultiTool_agents](https://github.com/avinashiitp/MultiTool_agents)
 
 ---
 
-## 🧩 What is a Skill?
+## 🧩 What is Memory?
 
-| | Without Skill | With Skill |
+| | Without Memory (Level 7) | With Memory (Level 8) |
 |---|---|---|
-| Agent's system prompt | `"You are a Research Agent. Be concise."` | A full structured SOP: step-by-step procedure, tool selection logic, output format rules, quality checks |
-| Agent behaviour | Varies — depends on Claude's defaults | Consistent — follows the SOP every time |
-| Bad output | Hard to debug — is it the tools or the agent? | Easy to debug — is it the SOP or the tools? |
-| Reusability | Prompt lives inside one agent | Skill is a class, importable anywhere |
+| Between sessions | Agent forgets everything | Agent recalls relevant past interactions |
+| System prompt | Skill SOP only | Memory context + Skill SOP |
+| Same question asked twice | Full tool call every time | May reference past result directly |
+| Debugging | "What did it do before?" → no answer | Full interaction history in ChromaDB |
+| Personalisation | None | Agent builds context over time |
 
-A Skill is a **reusable knowledge package** — a structured prompt template / SOP that instructs an agent on how to perform a specific action, ensuring consistency and accuracy across every run.
+Memory is **semantic** — not keyword search. "France population" retrieves memories about "How many people live in France?" because they mean the same thing.
 
 ---
 
 ## 📁 Project Structure
 
 ```
-level7/
-├── .env                     ← API key
+level8/
+├── .env                        ← API key
 ├── .env.example
 ├── requirements.txt
 ├── README.md
 │
-├── main.py                  ← Orchestrator + all agents (entry point)
-├── mcp_server.py            ← 8 MCP tools (same as Level 6)
+├── main.py                     ← Entry point — Orchestrator + all agents
+├── mcp_server.py               ← 8 MCP tools (same as Level 7)
+│
+├── memory/
+│   ├── __init__.py
+│   └── memory_store.py         ← ChromaDB wrapper — save, retrieve, format
 │
 └── skills/
-    ├── __init__.py          ← clean exports
-    ├── base_skill.py        ← abstract BaseSkill class
-    ├── skill_loader.py      ← combines multiple skills into one prompt
-    ├── orchestrator_skill.py← OrchestratorSkill SOP
-    ├── research_skill.py    ← ResearchSkill + WeatherResearchSkill
-    ├── math_skill.py        ← MathSkill + EstimationSkill
-    └── writing_skill.py     ← WritingSkill + SummarizationSkill
+    ├── __init__.py
+    ├── base_skill.py
+    ├── skill_loader.py          ← Updated: accepts memory_context parameter
+    ├── orchestrator_skill.py
+    ├── research_skill.py
+    ├── math_skill.py
+    └── writing_skill.py
 ```
+
+Memory is stored on disk at `./memory_db/` — persists across process restarts.
 
 ---
 
@@ -49,189 +57,131 @@ level7/
 
 ```
 User
- └── Orchestrator Agent  [OrchestratorSkill SOP]
+ └── Orchestrator Agent  [OrchestratorSkill + Memory]
        │   tool: delegate_to_agent
        │
-       ├── Research Agent [ResearchSkill + WeatherResearchSkill]
+       ├── Research Agent [ResearchSkill + WeatherSkill + Memory]
        │     └── MCP tools: get_country_info, get_weather, define_word,
        │                    get_github_user, get_random_fact
        │
-       ├── Math Agent     [MathSkill]
+       ├── Math Agent     [MathSkill + Memory]
        │     └── MCP tools: calculate, convert_units
        │
-       └── Writing Agent  [WritingSkill]
+       └── Writing Agent  [WritingSkill + Memory]
              └── MCP tools: analyze_text
-                   └── All via mcp_server.py → live APIs
 ```
 
-Each agent has two power sources:
-- **Skill** → tells it HOW to think and act (the SOP)
+Each agent has THREE power sources:
+- **Skill** → tells it HOW to think (the SOP)
 - **MCP tools** → gives it the ability to act (the capability)
+- **Memory** → gives it context from the past (the experience)
 
 ---
 
 ## 🔑 Key Concepts
 
-### BaseSkill
+### MemoryStore
 
-Every skill inherits from `BaseSkill`:
+Each agent gets its own `MemoryStore` — a named ChromaDB collection:
 
 ```python
-class BaseSkill(ABC):
-    @property
-    def name(self) -> str: ...          # unique identifier
+store = MemoryStore(agent_name="research", persist_dir="./memory_db")
 
-    @property
-    def description(self) -> str: ...  # one-line summary
+# Save an interaction
+store.save(user_input="What is France's population?", response="67.75 million")
 
-    def build_prompt(self) -> str: ... # returns the full SOP string
+# Retrieve top-3 semantically similar past interactions
+memories = store.retrieve(query="France population stats", n_results=3)
+
+# Format for injection into system prompt
+context = store.format_for_prompt(query="France population stats")
 ```
 
-### SkillLoader
-
-Combines one or more skills into a single system prompt:
+### Memory → System Prompt Flow
 
 ```python
-# Single skill
-prompt = SkillLoader.build(ResearchSkill())
-
-# Multiple skills combined — useful for agents with broad scope
-prompt = SkillLoader.build(ResearchSkill(), WeatherResearchSkill())
-```
-
-### Skill → System Prompt Flow
-
-```python
-# Level 6 (no skill):
-system = "You are a specialist Research Agent. Be concise and accurate."
-
-# Level 7 (with skill):
+# Level 7 (no memory):
 system = SkillLoader.build(ResearchSkill())
-# → injects a full SOP covering:
-#   STEP 1: Understand the question
-#   STEP 2: Select the right tool
-#   STEP 3: Execute and validate
-#   STEP 4: Format your response
-#   Quality checks, output format rules...
+# → just the SOP
+
+# Level 8 (with memory):
+memory_context = store.format_for_prompt(query=task)
+system = f"{memory_context}\n\n{skill_prompt}"
+# → past relevant interactions + SOP
 ```
 
----
-
-## 📚 Skills Reference
-
-### OrchestratorSkill
-SOP for task decomposition, agent assignment, and result synthesis.
-Defines exactly how the Orchestrator should break a question, which agent handles what, and how to write a cohesive final answer.
-
-### ResearchSkill
-SOP for factual research tasks.
-Covers: question understanding → tool selection logic → validation → output format.
-
-### WeatherResearchSkill
-Sub-skill focused on weather queries.
-Covers: location extraction → tool execution → output with practical advice.
-Can be combined with ResearchSkill via `SkillLoader.build(ResearchSkill(), WeatherResearchSkill())`.
-
-### MathSkill
-SOP for calculations and unit conversions.
-Covers: task classification (calculate vs convert) → expression preparation → Python-safe syntax rules → result formatting.
-
-### EstimationSkill
-Sub-skill for Fermi estimation and order-of-magnitude reasoning.
-Can be combined with MathSkill for agents handling estimation tasks.
-
-### WritingSkill
-SOP for drafting, editing, summarizing, and text analysis.
-Covers: task classification → planning before writing → tone calibration by audience → quality checks.
-
-### SummarizationSkill
-Sub-skill focused on condensing long content into structured summaries.
-Can be combined with WritingSkill.
-
----
-
-## 🛠 Adding a New Skill
-
-Create a new file in `skills/`:
+### Memory saved after every interaction
 
 ```python
-# skills/code_skill.py
-from skills.base_skill import BaseSkill
-
-class CodeSkill(BaseSkill):
-
-    @property
-    def name(self) -> str:
-        return "code_skill"
-
-    @property
-    def description(self) -> str:
-        return "SOP for code review, debugging, and explanation tasks"
-
-    def build_prompt(self) -> str:
-        return """
-You are a specialist Code Agent.
-
-── CODE REVIEW SOP ──
-
-STEP 1 — UNDERSTAND THE CODE
-  → Identify the language and purpose
-  → Read for intent before reading for bugs
-
-STEP 2 — ANALYSE
-  → Check logic correctness first
-  → Check edge cases second
-  → Check style last
-
-STEP 3 — RESPOND
-  → Lead with the most critical issue
-  → Suggest fixes, not just problems
-""".strip()
+# After agent completes:
+store.save(user_input=task, response=final_response)
+# Stored as: "User: {task} | Agent: {response}"
+# ChromaDB embeds this text for future semantic retrieval
 ```
 
-Then export it in `skills/__init__.py` and load it in any agent:
+### Separate memory per agent
 
 ```python
-from skills import CodeSkill
-skill_prompt = SkillLoader.build(CodeSkill())
-```
-
----
-
-## 🛠 Adding a New Agent
-
-1. Add the agent function in `main.py`:
-```python
-async def code_agent(session, task):
-    skill_prompt = SkillLoader.build(CodeSkill())
-    return await run_agent(
-        session=session,
-        skill_prompt=skill_prompt,
-        user_task=task,
-        allowed_tools=["analyze_text"],   # add code tools to mcp_server.py
-        label="Code",
-    )
-```
-
-2. Register in the Orchestrator's routing table:
-```python
-agents = {
-    "research": research_agent,
-    "math":     math_agent,
-    "writing":  writing_agent,
-    "code":     code_agent,        # ← add here
+memory_stores = {
+    "research":     MemoryStore("research"),
+    "math":         MemoryStore("math"),
+    "writing":      MemoryStore("writing"),
+    "orchestrator": MemoryStore("orchestrator"),
 }
 ```
 
-3. Add `"code"` to the `delegate_to_agent` enum in the delegation tool.
+Research memories never bleed into Math memories. Each agent builds its own experience independently.
+
+---
+
+## 📚 Memory Reference
+
+### `MemoryStore(agent_name, persist_dir)`
+Creates or loads a ChromaDB collection for this agent. Data persists to disk.
+
+### `store.save(user_input, response, session_id)`
+Saves one interaction. Stored text: `"User: {input} | Agent: {response}"`.
+
+### `store.retrieve(query, n_results=3)`
+Semantic search — returns top-n most similar past interactions as list of dicts.
+
+### `store.format_for_prompt(query, n_results=3)`
+Returns a formatted string block ready to prepend to the skill prompt.
+Returns empty string if no memories exist — prompt is not polluted.
+
+### `store.count()`
+Returns total number of stored memories.
+
+### `store.clear()`
+Deletes all memories for this agent. Also available via `clear memory` in the CLI.
+
+---
+
+## 🛠 Adding Memory to a New Agent
+
+```python
+# 1. Create a store
+memory_stores["code"] = MemoryStore(agent_name="code")
+
+# 2. Pass it into run_agent()
+result = await run_agent(
+    session=session,
+    skill_prompt=SkillLoader.build(CodeSkill()),
+    user_task=task,
+    memory_store=memory_stores["code"],   # ← add this
+    allowed_tools=["analyze_text"],
+    label="Code",
+)
+# Memory retrieval + saving is handled automatically inside run_agent()
+```
 
 ---
 
 ## ⚙️ Setup
 
 ```bash
-git clone https://github.com/avinashiitp/level7_skills.git
-cd level7_skills
+git clone https://github.com/avinashiitp/agent_memory.git
+cd agent_memory
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -247,11 +197,21 @@ cp .env.example .env
 python main.py mcp_server.py
 ```
 
-Try:
+**Special CLI commands:**
 ```
-You: What is the population of France, convert 500km to miles, and write a travel tip
-You: Look up torvalds on GitHub and write a 2-sentence professional bio
-You: Define 'serendipity', calculate 2**16, and write a sentence using the word
+memory        → show memory stats for all agents
+clear memory  → wipe all stored memories
+```
+
+**Try this to see memory in action:**
+```
+# First run:
+You: What is the population of France?
+# Agent calls get_country_info tool, saves result to memory
+
+# Second run (same session or new session):
+You: Tell me more about France
+# Agent retrieves the France population memory, uses it as context
 ```
 
 ---
@@ -260,11 +220,11 @@ You: Define 'serendipity', calculate 2**16, and write a sentence using the word
 
 | Error | Fix |
 |-------|-----|
-| `ModuleNotFoundError: skills` | Run from the `level7/` directory |
+| `ModuleNotFoundError: chromadb` | `pip install chromadb` |
+| `ModuleNotFoundError: skills` | Run from the `level8/` directory |
 | `AuthenticationError` | Check `.env` has your Anthropic API key |
 | `ModuleNotFoundError: mcp` | `pip install mcp` |
-| `ModuleNotFoundError: dotenv` | `pip install python-dotenv` |
-| Agent gives generic answer | Check the skill's SOP — improve the relevant step |
+| Memory not persisting | Check `./memory_db/` directory exists and has write permission |
 
 ---
 
@@ -274,7 +234,8 @@ You: Define 'serendipity', calculate 2**16, and write a sentence using the word
 |-------|------|----------------|
 | 1–4 | [MultiTool_agents](https://github.com/avinashiitp/MultiTool_agents) | Single agent → multi-tool → live APIs → MCP |
 | 5–6 | [agent_to_agent](https://github.com/avinashiitp/agent_to_agent) | Agent-to-agent → Agent-to-agent-to-MCP |
-| 7 | this repo | Skills — structured SOPs for every agent |
+| 7 | [agent_skills](https://github.com/avinashiitp/agent_skills) | Skills — structured SOPs for every agent |
+| 8 | this repo | Memory — persistent vector memory via ChromaDB |
 
 ---
 

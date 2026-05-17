@@ -1,34 +1,43 @@
 """
-Level 7 — Agent + Skills + MCP
-================================
-Every agent is now powered by TWO things:
-  1. A SKILL  — a structured SOP injected as the system prompt (the HOW)
+Level 8 — Agent + Skills + MCP + Memory
+=========================================
+Every agent is now powered by THREE things:
+  1. A SKILL   — structured SOP injected as the system prompt (the HOW)
   2. MCP tools — discovered at runtime from the server (the WHAT)
+  3. MEMORY    — relevant past context retrieved from ChromaDB (the REMEMBER)
 
 Architecture:
   User
-   └── Orchestrator Agent  [OrchestratorSkill]
-         ├── Research Agent [ResearchSkill + WeatherResearchSkill] + MCP tools
-         ├── Math Agent     [MathSkill]                            + MCP tools
-         └── Writing Agent  [WritingSkill]                        + MCP tools
+   └── Orchestrator Agent  [OrchestratorSkill + Memory]
+         ├── Research Agent [ResearchSkill + WeatherResearchSkill + Memory] + MCP tools
+         ├── Math Agent     [MathSkill + Memory]                            + MCP tools
+         └── Writing Agent  [WritingSkill + Memory]                        + MCP tools
                                    └── all tools via mcp_server.py
+                                   └── all memory via ChromaDB (./memory_db)
 
-Key difference from Level 6:
-  Level 6: system prompt = a simple one-liner describing the agent's role
-  Level 7: system prompt = a full structured SOP from a Skill class
-            → agents know not just WHAT to do but HOW to do it step by step
+Key difference from Level 7:
+  Level 7: system = skill_prompt
+  Level 8: system = memory_context + skill_prompt
+            → agents know not just HOW to do it but WHAT they already know
+
+Memory flow per turn:
+  1. User asks question
+  2. MemoryStore retrieves semantically similar past interactions
+  3. Retrieved context injected into system prompt via SkillLoader.build_with_memory()
+  4. Agent responds with full context awareness
+  5. User question + agent response stored back into MemoryStore
 """
 
 import os
 import sys
 import json
+import uuid
 import asyncio
 import anthropic
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-# Import skills
 from skills import (
     ResearchSkill,
     WeatherResearchSkill,
@@ -37,50 +46,60 @@ from skills import (
     OrchestratorSkill,
 )
 from skills.skill_loader import SkillLoader
+from memory.memory_store import MemoryStore
 
 load_dotenv()
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-MODEL = "claude-opus-4-5"
+MODEL = "claude-sonnet-4-6"
 
 
 # ---------------------------------------------------------------------------
-# Core: Universal Agent Loop with Skills + MCP
+# Core: Universal Agent Loop with Skills + MCP + Memory
 # ---------------------------------------------------------------------------
 
 async def run_agent(
     session: ClientSession,
     skill_prompt: str,
     user_task: str,
+    memory: MemoryStore,
     allowed_tools: list[str] | None = None,
     label: str = "Agent",
+    agent_name: str = "agent",
+    session_id: str = "default",
 ) -> str:
     """
-    Run a Claude agent powered by a Skill (SOP) and MCP tools.
+    Run a Claude agent powered by a Skill + MCP tools + Memory.
 
-    Args:
-        session:       Active MCP session to the tool server
-        skill_prompt:  The SOP built by SkillLoader — becomes the system prompt
-        user_task:     The specific task this agent must complete
-        allowed_tools: Which MCP tools this agent can see (agent scoping)
-        label:         Display name for logging
-
-    The key change from Level 6:
-        Level 6: system=system_prompt  (a simple one-liner)
-        Level 7: system=skill_prompt   (a full structured SOP from a Skill class)
+    Key change from Level 7:
+        Level 7: system = skill_prompt
+        Level 8: system = SkillLoader.build_with_memory(memory_context, skill)
+                 → memory context is retrieved BEFORE calling Claude
+                 → agent response is stored AFTER Claude responds
     """
-    # Discover and filter MCP tools
+    # 1. Retrieve relevant past context
+    past_memories = memory.retrieve(query=user_task, n_results=3)
+    memory_context = memory.format_for_prompt(past_memories)
+
+    if past_memories:
+        print(f"  [{label}] 🧠 {len(past_memories)} memories retrieved")
+
+    # 2. Build system prompt = memory context + skill SOP
+    # This is the core Level 8 change — skill_prompt passed in is the raw SOP,
+    # but we inject memory ABOVE it here
+    full_system = f"{memory_context}\n\n{skill_prompt}" if memory_context else skill_prompt
+
+    # 3. Discover and filter MCP tools
     mcp_tools = await session.list_tools()
     all_tools = mcp_tools.tools
     if allowed_tools:
         all_tools = [t for t in all_tools if t.name in allowed_tools]
 
-    # Convert MCP format → Anthropic format
     anthropic_tools = [
         {"name": t.name, "description": t.description, "input_schema": t.inputSchema}
         for t in all_tools
     ]
 
-    print(f"  [{label}] Skill loaded. Tools: {[t['name'] for t in anthropic_tools]}")
+    print(f"  [{label}] Skill + Memory loaded. Tools: {[t['name'] for t in anthropic_tools]}")
 
     messages = [{"role": "user", "content": user_task}]
 
@@ -88,14 +107,21 @@ async def run_agent(
         resp = client.messages.create(
             model=MODEL,
             max_tokens=1024,
-            system=skill_prompt,          # ← Skill SOP as system prompt
+            system=full_system,           # ← Memory context + Skill SOP
             tools=anthropic_tools if anthropic_tools else anthropic.NOT_GIVEN,
             messages=messages,
         )
         messages.append({"role": "assistant", "content": resp.content})
 
         if resp.stop_reason == "end_turn":
-            return next((b.text for b in resp.content if hasattr(b, "text")), "")
+            final_text = next((b.text for b in resp.content if hasattr(b, "text")), "")
+
+            # 4. Store this interaction in memory
+            memory.store(content=user_task,   role="user",  agent=agent_name, session_id=session_id)
+            memory.store(content=final_text,  role="agent", agent=agent_name, session_id=session_id)
+            print(f"  [{label}] 🧠 Interaction stored to memory")
+
+            return final_text
 
         tool_results = []
         for block in resp.content:
@@ -113,98 +139,94 @@ async def run_agent(
 
 
 # ---------------------------------------------------------------------------
-# Specialist Agents — each powered by a Skill
+# Specialist Agents
 # ---------------------------------------------------------------------------
 
-async def research_agent(session: ClientSession, task: str) -> str:
-    """
-    Research Agent powered by ResearchSkill + WeatherResearchSkill combined.
-    The SkillLoader merges both SOPs into one system prompt.
-    """
+async def research_agent(session: ClientSession, task: str, memory: MemoryStore, session_id: str) -> str:
     print(f"\n  🔬 RESEARCH AGENT ← {task}")
-
-    # Combine two skills for this agent
     skill_prompt = SkillLoader.build(ResearchSkill(), WeatherResearchSkill())
-    skill_desc = SkillLoader.describe(ResearchSkill(), WeatherResearchSkill())
-    print(f"  🔬 Skills loaded: {skill_desc}")
 
     result = await run_agent(
         session=session,
         skill_prompt=skill_prompt,
         user_task=task,
+        memory=memory,
         allowed_tools=["get_country_info", "get_weather", "define_word",
                        "get_github_user", "get_random_fact"],
         label="Research",
+        agent_name="research",
+        session_id=session_id,
     )
     print(f"  🔬 RESEARCH AGENT done.")
     return result
 
 
-async def math_agent(session: ClientSession, task: str) -> str:
-    """
-    Math Agent powered by MathSkill.
-    The SOP enforces tool-only computation and correct expression syntax.
-    """
+async def math_agent(session: ClientSession, task: str, memory: MemoryStore, session_id: str) -> str:
     print(f"\n  📐 MATH AGENT ← {task}")
-
     skill_prompt = SkillLoader.build(MathSkill())
-    print(f"  📐 Skills loaded: {SkillLoader.describe(MathSkill())}")
 
     result = await run_agent(
         session=session,
         skill_prompt=skill_prompt,
         user_task=task,
+        memory=memory,
         allowed_tools=["calculate", "convert_units"],
         label="Math",
+        agent_name="math",
+        session_id=session_id,
     )
     print(f"  📐 MATH AGENT done.")
     return result
 
 
-async def writing_agent(session: ClientSession, task: str) -> str:
-    """
-    Writing Agent powered by WritingSkill.
-    The SOP enforces audience analysis, structure, and tone calibration.
-    """
+async def writing_agent(session: ClientSession, task: str, memory: MemoryStore, session_id: str) -> str:
     print(f"\n  ✍️  WRITING AGENT ← {task}")
-
     skill_prompt = SkillLoader.build(WritingSkill())
-    print(f"  ✍️  Skills loaded: {SkillLoader.describe(WritingSkill())}")
 
     result = await run_agent(
         session=session,
         skill_prompt=skill_prompt,
         user_task=task,
+        memory=memory,
         allowed_tools=["analyze_text"],
         label="Writing",
+        agent_name="writing",
+        session_id=session_id,
     )
     print(f"  ✍️  WRITING AGENT done.")
     return result
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator — powered by OrchestratorSkill
+# Orchestrator
 # ---------------------------------------------------------------------------
 
-async def orchestrator(session: ClientSession, user_question: str) -> str:
+async def orchestrator(
+    session: ClientSession,
+    user_question: str,
+    memory: MemoryStore,
+    session_id: str,
+) -> str:
     """
-    Orchestrator Agent powered by OrchestratorSkill.
+    Orchestrator with Memory.
 
-    The OrchestratorSkill SOP defines:
-      - how to decompose questions into subtasks
-      - which agent to assign each subtask to
-      - how to synthesize results into a cohesive final answer
-
-    The Orchestrator has ONE tool: delegate_to_agent.
-    It does not use MCP tools directly — it delegates to specialists who do.
+    Memory is retrieved BEFORE decomposing the question.
+    If the answer (or part of it) exists in past context,
+    the OrchestratorSkill SOP instructs Claude to use it
+    instead of re-delegating.
     """
     print(f"\n🎯 ORCHESTRATOR ← {user_question}")
 
-    # Load the Orchestrator's skill
-    skill_prompt = SkillLoader.build(OrchestratorSkill())
-    print(f"🎯 Orchestrator skill loaded: {SkillLoader.describe(OrchestratorSkill())}")
+    # Retrieve memory for the orchestrator
+    past_memories = memory.retrieve(query=user_question, n_results=4)
+    memory_context = memory.format_for_prompt(past_memories)
 
-    # Orchestrator's only tool — delegate to specialists
+    if past_memories:
+        print(f"🧠 Orchestrator: {len(past_memories)} memories retrieved")
+
+    skill_prompt = SkillLoader.build(OrchestratorSkill())
+    full_system = f"{memory_context}\n\n{skill_prompt}" if memory_context else skill_prompt
+
     delegation_tool = {
         "name": "delegate_to_agent",
         "description": (
@@ -212,7 +234,7 @@ async def orchestrator(session: ClientSession, user_question: str) -> str:
             "Use 'research' for facts, countries, weather, GitHub, definitions. "
             "Use 'math' for calculations and unit conversions. "
             "Use 'writing' for drafting, editing, summarizing, word counts. "
-            "Each specialist is powered by a Skill SOP — they know how to do their job."
+            "Check past context first — if the answer is already known, do not re-delegate."
         ),
         "input_schema": {
             "type": "object",
@@ -232,9 +254,9 @@ async def orchestrator(session: ClientSession, user_question: str) -> str:
     }
 
     agents = {
-        "research": research_agent,
-        "math":     math_agent,
-        "writing":  writing_agent,
+        "research": lambda task: research_agent(session, task, memory, session_id),
+        "math":     lambda task: math_agent(session, task, memory, session_id),
+        "writing":  lambda task: writing_agent(session, task, memory, session_id),
     }
 
     messages = [{"role": "user", "content": user_question}]
@@ -243,14 +265,21 @@ async def orchestrator(session: ClientSession, user_question: str) -> str:
         resp = client.messages.create(
             model=MODEL,
             max_tokens=2048,
-            system=skill_prompt,         # ← OrchestratorSkill SOP
+            system=full_system,          # ← Memory context + OrchestratorSkill SOP
             tools=[delegation_tool],
             messages=messages,
         )
         messages.append({"role": "assistant", "content": resp.content})
 
         if resp.stop_reason == "end_turn":
-            return next((b.text for b in resp.content if hasattr(b, "text")), "")
+            final_text = next((b.text for b in resp.content if hasattr(b, "text")), "")
+
+            # Store orchestrator interaction
+            memory.store(content=user_question, role="user",  agent="orchestrator", session_id=session_id)
+            memory.store(content=final_text,    role="agent", agent="orchestrator", session_id=session_id)
+            print(f"🧠 Orchestrator: interaction stored to memory")
+
+            return final_text
 
         tool_results = []
         for block in resp.content:
@@ -259,7 +288,7 @@ async def orchestrator(session: ClientSession, user_question: str) -> str:
                 task = block.input["task"]
                 print(f"\n📤 ORCHESTRATOR → [{agent_name.upper()} AGENT] {task}")
                 specialist = agents[agent_name]
-                result = await specialist(session, task)
+                result = await specialist(task)
                 print(f"📥 ORCHESTRATOR ← [{agent_name.upper()} AGENT] done")
                 tool_results.append({
                     "type": "tool_result",
@@ -286,21 +315,29 @@ async def main():
     )
 
     print("=" * 65)
-    print("  Level 7 — Agent + Skills + MCP")
-    print("  Every agent is powered by a structured Skill SOP")
+    print("  Level 8 — Agent + Skills + MCP + Memory")
+    print("  Every agent remembers past interactions via ChromaDB")
     print("=" * 65)
+
+    # Initialise shared memory store (persists across sessions on disk)
+    memory = MemoryStore(persist_path="./memory_db")
+
+    # Unique session ID per run — groups this run's memories together
+    session_id = str(uuid.uuid4())[:8]
+    print(f"\n🔑 Session ID: {session_id}")
+    print(f"🧠 Total memories in store: {memory.count()}\n")
 
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
 
             tools = await session.list_tools()
-            print(f"\n✅ MCP Server connected. {len(tools.tools)} tools available.")
-            print(f"📚 Skills loaded: ResearchSkill, WeatherResearchSkill, MathSkill, WritingSkill, OrchestratorSkill\n")
+            print(f"✅ MCP Server connected. {len(tools.tools)} tools available.")
+            print(f"📚 Skills: ResearchSkill, MathSkill, WritingSkill, OrchestratorSkill")
+            print(f"🧠 Memory: ChromaDB at ./memory_db\n")
 
-            print("Type 'quit' to exit.")
-            print("Try: 'What is the population of France, convert 500km to miles, and write a one-sentence travel tip'")
-            print("Try: 'Look up torvalds on GitHub and write a 2-sentence professional bio'\n")
+            print("Type 'quit' to exit. Type 'memory' to see memory stats.")
+            print("Try asking the same question twice — the second time uses memory.\n")
 
             while True:
                 try:
@@ -312,10 +349,15 @@ async def main():
                 if user_input.lower() in ("quit", "exit", "q"):
                     print("Goodbye!")
                     break
+
+                if user_input.lower() == "memory":
+                    print(f"🧠 Total memories stored: {memory.count()}")
+                    continue
+
                 if not user_input:
                     continue
 
-                answer = await orchestrator(session, user_input)
+                answer = await orchestrator(session, user_input, memory, session_id)
                 print(f"\n✅ Final Answer:\n{answer}\n")
                 print("-" * 65)
 
